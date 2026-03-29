@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="gray">#888888</color>
+
+    <!-- Google/Claude inspired soft palette -->
+    <color name="brand_primary">#4285F4</color>
+    <color name="brand_background">#F8F9FA</color>
+    <color name="brand_surface">#FFFFFF</color>
+    <color name="text_primary">#202124</color>
+    <color name="text_secondary">#5F6368</color>
+    <color name="input_stroke">#DADCE0</color>
+    <color name="accent_soft">#E8F0FE</color>
+
+    <!-- Dark Theme (Claude/Chat style) -->
+    <color name="dark_background">#1A1A1A</color>
+    <color name="dark_surface">#2D2D2D</color>
+    <color name="dark_text_primary">#FFFFFF</color>
+    <color name="dark_text_secondary">#B0B0B0</color>
+    <color name="dark_accent">#E06C4D</color> <!-- Orange-ish from screenshot -->
+</resources>

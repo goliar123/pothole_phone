@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Pothole Tracker</string>
+    <string name="gpu">GPU</string>
+    <string name="inference_time_format">%dms</string>
+    <string name="login_title">Welcome Back</string>
+    <string name="login_subtitle">Sign in to start tracking potholes</string>
+    <string name="email_hint">Email</string>
+    <string name="password_hint">Password</string>
+    <string name="login_button">Login</string>
+    <string name="start_tracking">Start Detection</string>
+    <string name="pothole_detected">Pothole Detected!</string>
+</resources>
