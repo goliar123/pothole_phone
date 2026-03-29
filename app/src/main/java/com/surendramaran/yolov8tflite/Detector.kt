@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import com.surendramaran.yolov8tflite.MetaData.extractNamesFromLabelFile
+import com.surendramaran.yolov8tflite.MetaData.extractNamesFromMetadata
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -53,8 +54,20 @@ class Detector(
                 val inputShape = tflite.getInputTensor(0)?.shape()
                 val outputShape = tflite.getOutputTensor(0)?.shape()
 
-                labels.clear()
-                labels.addAll(MetaData.TEMP_CLASSES)
+                // Resolve labels: Metadata -> Label File -> Hardcoded Fallback
+                val metadataLabels = extractNamesFromMetadata(model)
+                if (metadataLabels.isNotEmpty()) {
+                    labels.addAll(metadataLabels)
+                } else if (labelPath != null) {
+                    val fileLabels = extractNamesFromLabelFile(context, labelPath)
+                    if (fileLabels.isNotEmpty()) {
+                        labels.addAll(fileLabels)
+                    }
+                }
+
+                if (labels.isEmpty()) {
+                    labels.addAll(MetaData.TEMP_CLASSES)
+                }
 
                 if (inputShape != null) {
                     tensorWidth = inputShape[1]
@@ -89,11 +102,18 @@ class Detector(
             tensorImage.load(resizedBitmap)
             val processedImage = imageProcessor.process(tensorImage)
             val output = TensorBuffer.createFixedSize(intArrayOf(1, numChannel, numElements), OUTPUT_IMAGE_TYPE)
+            
             interpreter?.run(processedImage.buffer, output.buffer) ?: return
+            
             val bestBoxes = bestBox(output.floatArray)
             inferenceTime = SystemClock.uptimeMillis() - inferenceTime
-            if (bestBoxes == null) detectorListener.onEmptyDetect()
-            else detectorListener.onDetect(bestBoxes, inferenceTime)
+            
+            if (bestBoxes == null) {
+                detectorListener.onEmptyDetect()
+            } else {
+                // Pass the frame used for detection back to listener to avoid re-capturing
+                detectorListener.onDetect(bestBoxes, inferenceTime, frame)
+            }
         } catch (e: Exception) {
             Log.e("Detector", "Detect Error: ${e.message}")
         }
@@ -121,7 +141,7 @@ class Detector(
                 val w = array[c + numElements * 2]
                 val h = array[c + numElements * 3]
                 
-                // NORMALIZE coordinates (0.0 to 1.0)
+                // Normalized coordinates (0.0 to 1.0)
                 val x1 = (cx - (w / 2F)) / tensorWidth
                 val y1 = (cy - (h / 2F)) / tensorHeight
                 val x2 = (cx + (w / 2F)) / tensorWidth
@@ -155,18 +175,15 @@ class Detector(
         val x2 = minOf(box1.x2, box2.x2)
         val y2 = minOf(box1.y2, box2.y2)
         val intersectionArea = maxOf(0F, x2 - x1) * maxOf(0F, y2 - y1)
-        
-        // Calculate areas using normalized coordinates
         val box1Area = (box1.x2 - box1.x1) * (box1.y2 - box1.y1)
         val box2Area = (box2.x2 - box2.x1) * (box2.y2 - box2.y1)
-        
-        return if (box1Area + box2Area - intersectionArea <= 0) 0f 
-               else intersectionArea / (box1Area + box2Area - intersectionArea)
+        val union = box1Area + box2Area - intersectionArea
+        return if (union <= 0) 0f else intersectionArea / union
     }
 
     interface DetectorListener {
         fun onEmptyDetect()
-        fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long)
+        fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long, frame: Bitmap)
     }
 
     companion object {

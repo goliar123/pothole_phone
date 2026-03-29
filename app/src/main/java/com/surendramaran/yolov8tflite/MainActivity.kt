@@ -10,6 +10,7 @@ import android.graphics.RectF
 import android.location.Geocoder
 import android.location.Location
 import android.os.Bundle
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -18,8 +19,7 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.*
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
@@ -29,6 +29,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.tan
@@ -47,8 +48,19 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var isDetecting = false
 
-    private val recentDetections = mutableListOf<PotholeReport>()
+    private val recentDetections = ConcurrentLinkedQueue<PotholeReport>()
+    private var currentLocation: Location? = null
     private val DB_URL = "https://pothhole-detect-default-rtdb.firebaseio.com/"
+
+    private var bitmapBuffer: Bitmap? = null
+    private var rotatedBitmap: Bitmap? = null
+    private val rotationMatrix = Matrix()
+
+    private val locationCallback = object : LocationCallback() {
+        override fun onLocationResult(locationResult: LocationResult) {
+            currentLocation = locationResult.lastLocation
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,7 +68,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             binding = ActivityMainBinding.inflate(layoutInflater)
             setContentView(binding.root)
 
-            // Setup database reference
             val fbInstance = FirebaseDatabase.getInstance(DB_URL)
             database = fbInstance.getReference("potholes")
 
@@ -90,11 +101,16 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun startDetection() {
         isDetecting = true
         binding.cameraOverlay.visibility = View.GONE
         binding.startDetectionBtn.text = "Stop Detection"
         binding.startDetectionBtn.extend()
+        
+        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000).build()
+        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
+        
         startCamera()
     }
 
@@ -103,6 +119,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         binding.cameraOverlay.visibility = View.VISIBLE
         binding.startDetectionBtn.text = "Start Detection"
         binding.startDetectionBtn.shrink()
+        
+        fusedLocationClient.removeLocationUpdates(locationCallback)
         cameraProvider?.unbindAll()
         binding.overlay.clear()
         binding.inferenceTime.text = ""
@@ -142,20 +160,23 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             .build()
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
-            val bitmapBuffer = Bitmap.createBitmap(
-                imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888
-            )
-            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-
-            val matrix = Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            if (bitmapBuffer == null || bitmapBuffer?.width != imageProxy.width || bitmapBuffer?.height != imageProxy.height) {
+                bitmapBuffer = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
             }
+            
+            bitmapBuffer?.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
 
-            val rotatedBitmap = Bitmap.createBitmap(
-                bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height, matrix, true
+            rotationMatrix.reset()
+            rotationMatrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+
+            val newRotated = Bitmap.createBitmap(
+                bitmapBuffer!!, 0, 0, imageProxy.width, imageProxy.height, rotationMatrix, true
             )
+            
+            rotatedBitmap?.recycle()
+            rotatedBitmap = newRotated
 
-            detector?.detect(rotatedBitmap)
+            detector?.detect(rotatedBitmap!!)
             imageProxy.close()
         }
 
@@ -168,20 +189,39 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
-    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
+    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long, frame: Bitmap) {
         if (!isDetecting) return
         
         for (box in boundingBoxes) {
-            // LOG EVERYTHING for visibility
-            Log.d(TAG, "UPLOADING: detected label '${box.clsName}' with confidence ${box.cnf}")
-
-            // Trigger upload for ANY detection during this debug phase
-            val rect = RectF(box.x1, box.y1, box.x2, box.y2)
-            val costLabel = calculatePotholeCost(rect, 640, 640)
+            val frameWidth = frame.width
+            val frameHeight = frame.height
+            val scaledRect = RectF(
+                box.x1 * frameWidth,
+                box.y1 * frameHeight,
+                box.x2 * frameWidth,
+                box.y2 * frameHeight
+            )
             
-            val viewFinderBitmap = binding.viewFinder.bitmap
-            if (viewFinderBitmap != null) {
-                processDetection(costLabel, viewFinderBitmap, box.clsName)
+            val costLabel = calculatePotholeCost(scaledRect, frameWidth, frameHeight)
+            val currentTime = System.currentTimeMillis()
+            val loc = currentLocation
+
+            // Duplicate Check
+            val isDuplicate = recentDetections.any { 
+                val timeDiff = (currentTime - (it.time ?: 0)) / 1000
+                val results = FloatArray(1)
+                if (loc != null && it.lat != null && it.lng != null) {
+                    Location.distanceBetween(loc.latitude, loc.longitude, it.lat, it.lng, results)
+                }
+                val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
+                timeDiff < 30 && distance < 5.0
+            }
+
+            if (!isDuplicate) {
+                // If location is null, we still log but with a placeholder to verify Firebase connection
+                saveDetectionLocally(loc, costLabel, currentTime, frame, box.clsName)
+            } else {
+                Log.d(TAG, "Detection skipped: Duplicate")
             }
         }
 
@@ -189,28 +229,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             binding.inferenceTime.text = "${inferenceTime}ms"
             binding.overlay.setResults(boundingBoxes)
             binding.overlay.invalidate()
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun processDetection(cost: String, bitmap: Bitmap, label: String) {
-        fusedLocationClient.lastLocation.addOnSuccessListener { location ->
-            val currentTime = System.currentTimeMillis()
-            
-            // Check proximity to avoid duplicate spamming
-            val isDuplicate = recentDetections.any { 
-                val timeDiff = (currentTime - (it.time ?: 0)) / 1000
-                val results = FloatArray(1)
-                if (location != null && it.lat != null && it.lng != null) {
-                    Location.distanceBetween(location.latitude, location.longitude, it.lat, it.lng, results)
-                }
-                val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
-                timeDiff < 30 && distance < 2.0 // Very relaxed duplicate check
-            }
-
-            if (!isDuplicate) {
-                saveDetectionLocally(location, cost, currentTime, bitmap, label)
-            }
         }
     }
 
@@ -223,7 +241,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 70, fos)
             fos.close()
 
-            val address = location?.let { getAddress(it.latitude, it.longitude) } ?: "No Location Found"
+            val address = location?.let { getAddress(it.latitude, it.longitude) } ?: "Location Pending..."
             
             val report = PotholeReport(
                 lat = location?.latitude ?: 0.0,
@@ -236,20 +254,19 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 isDuplicate = false
             )
             
-            // Upload to Firebase
             database.push().setValue(report).addOnCompleteListener { task ->
                 if (task.isSuccessful) {
-                    Log.d(TAG, "SUCCESS: Pushed detection '$label' to Firebase")
+                    Log.d(TAG, "FIREBASE SUCCESS: Data pushed to $DB_URL")
                 } else {
-                    Log.e(TAG, "ERROR: Firebase upload failed - ${task.exception?.message}")
+                    Log.e(TAG, "FIREBASE ERROR: ${task.exception?.message}")
                 }
             }
             
             recentDetections.add(report)
-            if (recentDetections.size > 50) recentDetections.removeAt(0)
+            if (recentDetections.size > 20) recentDetections.poll()
             
             runOnUiThread {
-                Toast.makeText(baseContext, "Logged: $label", Toast.LENGTH_SHORT).show()
+                Toast.makeText(baseContext, "Detection Logged: $label", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Local save error: ${e.message}")
@@ -310,7 +327,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
-            Manifest.permission.ACCESS_FINE_LOCATION
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
         )
     }
 }
