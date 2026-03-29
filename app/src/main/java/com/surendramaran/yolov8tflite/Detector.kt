@@ -29,8 +29,9 @@ class Detector(
     private var labels = mutableListOf<String>()
     private var tensorWidth = 0
     private var tensorHeight = 0
-    private var numChannel = 0
-    private var numElements = 0
+    private var numRows = 0
+    private var numCols = 0
+    private var isTransposed = false
 
     private val imageProcessor = ImageProcessor.Builder()
         .add(NormalizeOp(INPUT_MEAN, INPUT_STANDARD_DEVIATION))
@@ -78,8 +79,17 @@ class Detector(
                     }
                 }
                 if (outputShape != null) {
-                    numChannel = outputShape[1]
-                    numElements = outputShape[2]
+                    if (outputShape[1] > outputShape[2]) {
+                        // Newer YOLOv8 shape: [1, 8400, 84]
+                        numRows = outputShape[1]
+                        numCols = outputShape[2]
+                        isTransposed = false
+                    } else {
+                        // Older YOLOv8 shape: [1, 84, 8400]
+                        numCols = outputShape[1]
+                        numRows = outputShape[2]
+                        isTransposed = true
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -101,8 +111,9 @@ class Detector(
             val tensorImage = TensorImage(INPUT_IMAGE_TYPE)
             tensorImage.load(resizedBitmap)
             val processedImage = imageProcessor.process(tensorImage)
-            val output = TensorBuffer.createFixedSize(intArrayOf(1, numChannel, numElements), OUTPUT_IMAGE_TYPE)
-            
+            // Ensure the Java buffer shape exactly matches the model's expected tensor shape
+            val expectedShape = if (isTransposed) intArrayOf(1, numCols, numRows) else intArrayOf(1, numRows, numCols)
+            val output = TensorBuffer.createFixedSize(expectedShape, OUTPUT_IMAGE_TYPE)
             interpreter?.run(processedImage.buffer, output.buffer) ?: return
             
             val bestBoxes = bestBox(output.floatArray)
@@ -119,35 +130,55 @@ class Detector(
         }
     }
 
-    private fun bestBox(array: FloatArray) : List<BoundingBox>? {
+    private fun bestBox(array: FloatArray): List<BoundingBox>? {
         val boundingBoxes = mutableListOf<BoundingBox>()
-        for (c in 0 until numElements) {
+
+        for (r in 0 until numRows) {
+            val cx: Float
+            val cy: Float
+            val w: Float
+            val h: Float
+
+            // 1. Handle dynamic tensor shapes automatically
+            if (isTransposed) {
+                cx = array[0 * numRows + r]
+                cy = array[1 * numRows + r]
+                w = array[2 * numRows + r]
+                h = array[3 * numRows + r]
+            } else {
+                cx = array[r * numCols + 0]
+                cy = array[r * numCols + 1]
+                w = array[r * numCols + 2]
+                h = array[r * numCols + 3]
+            }
+
             var maxConf = -1.0f
             var maxIdx = -1
-            var j = 4
-            while (j < numChannel) {
-                val arrayIdx = c + numElements * j
-                if (arrayIdx < array.size && array[arrayIdx] > maxConf) {
-                    maxConf = array[arrayIdx]
+
+            for (j in 4 until numCols) {
+                val conf = if (isTransposed) array[j * numRows + r] else array[r * numCols + j]
+                if (conf > maxConf) {
+                    maxConf = conf
                     maxIdx = j - 4
                 }
-                j++
             }
 
             if (maxConf > CONFIDENCE_THRESHOLD) {
                 val clsName = labels.getOrElse(maxIdx) { "Class #$maxIdx" }
-                val cx = array[c]
-                val cy = array[c + numElements]
-                val w = array[c + numElements * 2]
-                val h = array[c + numElements * 3]
-                
-                // Normalized coordinates (0.0 to 1.0)
-                val x1 = (cx - (w / 2F)) / tensorWidth
-                val y1 = (cy - (h / 2F)) / tensorHeight
-                val x2 = (cx + (w / 2F)) / tensorWidth
-                val y2 = (cy + (h / 2F)) / tensorHeight
-                
-                boundingBoxes.add(BoundingBox(x1, y1, x2, y2, cx, cy, w, h, maxConf, maxIdx, clsName))
+
+                // 2. The Scaling Fix: Dynamically check if the model output is absolute or normalized
+                val scaleX = if (cx > 1.5f || w > 1.5f) tensorWidth.toFloat() else 1f
+                val scaleY = if (cy > 1.5f || h > 1.5f) tensorHeight.toFloat() else 1f
+
+                val x1 = (cx - (w / 2F)) / scaleX
+                val y1 = (cy - (h / 2F)) / scaleY
+                val x2 = (cx + (w / 2F)) / scaleX
+                val y2 = (cy + (h / 2F)) / scaleY
+
+                // Ensure the coordinates aren't wild outliers before
+                if (w*h>=0.5f) {
+                      boundingBoxes.add(BoundingBox(x1, y1, x2, y2, cx, cy, w, h, maxConf, maxIdx, clsName))
+                }
             }
         }
         return if (boundingBoxes.isEmpty()) null else applyNMS(boundingBoxes)
@@ -191,7 +222,7 @@ class Detector(
         private const val INPUT_STANDARD_DEVIATION = 255f
         private val INPUT_IMAGE_TYPE = DataType.FLOAT32
         private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
-        private const val CONFIDENCE_THRESHOLD = 0.35F 
+        private const val CONFIDENCE_THRESHOLD = 0.7F
         private const val IOU_THRESHOLD = 0.5F
     }
 }

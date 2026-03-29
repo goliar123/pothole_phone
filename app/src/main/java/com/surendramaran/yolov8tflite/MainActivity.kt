@@ -10,7 +10,6 @@ import android.graphics.RectF
 import android.location.Geocoder
 import android.location.Location
 import android.os.Bundle
-import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -19,7 +18,8 @@ import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.google.android.gms.location.*
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationServices
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
@@ -29,7 +29,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
-import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.tan
@@ -47,20 +46,10 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private lateinit var database: DatabaseReference
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var isDetecting = false
+    private var lastInferenceTime = 0L // <--- ADD THIS LINE
+    private val recentDetections = mutableListOf<PotholeReport>()
+    private val DB_URL = "https://pothhole-detect-default-rtdb.firebaseio.com"
 
-    private val recentDetections = ConcurrentLinkedQueue<PotholeReport>()
-    private var currentLocation: Location? = null
-    private val DB_URL = "https://pothhole-detect-default-rtdb.firebaseio.com/"
-
-    private var bitmapBuffer: Bitmap? = null
-    private var rotatedBitmap: Bitmap? = null
-    private val rotationMatrix = Matrix()
-
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(locationResult: LocationResult) {
-            currentLocation = locationResult.lastLocation
-        }
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,9 +57,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             binding = ActivityMainBinding.inflate(layoutInflater)
             setContentView(binding.root)
 
-            val fbInstance = FirebaseDatabase.getInstance(DB_URL)
-            database = fbInstance.getReference("potholes")
-
+            // Database setup
+            database = FirebaseDatabase.getInstance(DB_URL).getReference("potholes")
             fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
             cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -96,21 +84,16 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Activity Setup Error: ${e.message}")
+            Log.e(TAG, "Activity creation error: ${e.message}")
             finish()
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun startDetection() {
         isDetecting = true
         binding.cameraOverlay.visibility = View.GONE
         binding.startDetectionBtn.text = "Stop Detection"
         binding.startDetectionBtn.extend()
-        
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000).build()
-        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
-        
         startCamera()
     }
 
@@ -119,8 +102,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         binding.cameraOverlay.visibility = View.VISIBLE
         binding.startDetectionBtn.text = "Start Detection"
         binding.startDetectionBtn.shrink()
-        
-        fusedLocationClient.removeLocationUpdates(locationCallback)
         cameraProvider?.unbindAll()
         binding.overlay.clear()
         binding.inferenceTime.text = ""
@@ -133,7 +114,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 cameraProvider = cameraProviderFuture.get()
                 bindCameraUseCases()
             } catch (e: Exception) {
-                Log.e(TAG, "Camera Start error: ${e.message}")
+                Log.e(TAG, "CameraX setup failed: ${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -160,23 +141,32 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             .build()
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
-            if (bitmapBuffer == null || bitmapBuffer?.width != imageProxy.width || bitmapBuffer?.height != imageProxy.height) {
-                bitmapBuffer = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
+
+            // --- NEW THROTTLING LOGIC ---
+            val currentTime = System.currentTimeMillis()
+            // 500ms means 2 frames per second. Change to 1000 for 1 frame per second.
+            if (currentTime - lastInferenceTime < 150) {
+                imageProxy.close() // CRITICAL: You must close the proxy or the camera freezes!
+                return@setAnalyzer
             }
-            
-            bitmapBuffer?.copyPixelsFromBuffer(imageProxy.planes[0].buffer)
+            lastInferenceTime = currentTime
+            // ----------------------------
 
-            rotationMatrix.reset()
-            rotationMatrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-
-            val newRotated = Bitmap.createBitmap(
-                bitmapBuffer!!, 0, 0, imageProxy.width, imageProxy.height, rotationMatrix, true
+            // Your existing code stays exactly the same below:
+            val bitmapBuffer = Bitmap.createBitmap(
+                imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888
             )
-            
-            rotatedBitmap?.recycle()
-            rotatedBitmap = newRotated
+            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
 
-            detector?.detect(rotatedBitmap!!)
+            val matrix = Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            }
+
+            val rotatedBitmap = Bitmap.createBitmap(
+                bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height, matrix, true
+            )
+
+            detector?.detect(rotatedBitmap)
             imageProxy.close()
         }
 
@@ -189,46 +179,44 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
-    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long, frame: Bitmap) {
+    override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long,frame: Bitmap) {
         if (!isDetecting) return
-        
+
         for (box in boundingBoxes) {
-            val frameWidth = frame.width
-            val frameHeight = frame.height
-            val scaledRect = RectF(
-                box.x1 * frameWidth,
-                box.y1 * frameHeight,
-                box.x2 * frameWidth,
-                box.y2 * frameHeight
-            )
-            
-            val costLabel = calculatePotholeCost(scaledRect, frameWidth, frameHeight)
-            val currentTime = System.currentTimeMillis()
-            val loc = currentLocation
+            Log.d(TAG, "DETECTION: ${box.clsName} @ ${box.cnf}")
 
-            // Duplicate Check
-            val isDuplicate = recentDetections.any { 
-                val timeDiff = (currentTime - (it.time ?: 0)) / 1000
-                val results = FloatArray(1)
-                if (loc != null && it.lat != null && it.lng != null) {
-                    Location.distanceBetween(loc.latitude, loc.longitude, it.lat, it.lng, results)
-                }
-                val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
-                timeDiff < 30 && distance < 5.0
-            }
+            // Trigger upload for ANY detected crack/pothole from your label list
+            val rect = RectF(box.x1, box.y1, box.x2, box.y2)
+            val costLabel = calculatePotholeCost(rect, 640, 640)
 
-            if (!isDuplicate) {
-                // If location is null, we still log but with a placeholder to verify Firebase connection
-                saveDetectionLocally(loc, costLabel, currentTime, frame, box.clsName)
-            } else {
-                Log.d(TAG, "Detection skipped: Duplicate")
-            }
+            processDetection(costLabel, frame, box.clsName)
         }
 
         runOnUiThread {
             binding.inferenceTime.text = "${inferenceTime}ms"
             binding.overlay.setResults(boundingBoxes)
             binding.overlay.invalidate()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun processDetection(cost: String, bitmap: Bitmap, originalLabel: String) {
+        fusedLocationClient.lastLocation.addOnSuccessListener { location ->
+            val currentTime = System.currentTimeMillis()
+
+            val isDuplicate = recentDetections.any {
+                val timeDiff = (currentTime - (it.time ?: 0)) / 1000
+                val results = FloatArray(1)
+                if (location != null && it.lat != null && it.lng != null) {
+                    Location.distanceBetween(location.latitude, location.longitude, it.lat, it.lng, results)
+                }
+                val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
+                timeDiff < 5 && distance < 2.0
+            }
+
+            if (!isDuplicate) {
+                saveDetectionLocally(location, cost, currentTime, bitmap, originalLabel)
+            }
         }
     }
 
@@ -241,35 +229,32 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 70, fos)
             fos.close()
 
-            val address = location?.let { getAddress(it.latitude, it.longitude) } ?: "Location Pending..."
-            
+            val address = location?.let { getAddress(it.latitude, it.longitude) } ?: "Indoor/No Location"
+
             val report = PotholeReport(
                 lat = location?.latitude ?: 0.0,
                 lng = location?.longitude ?: 0.0,
                 address = address,
                 cost = cost,
                 time = time,
-                status = "Pending ($label)", 
+                status = "Pending ($label)", // Include original label
                 localImagePath = file.absolutePath,
                 isDuplicate = false
             )
-            
+
             database.push().setValue(report).addOnCompleteListener { task ->
-                if (task.isSuccessful) {
-                    Log.d(TAG, "FIREBASE SUCCESS: Data pushed to $DB_URL")
-                } else {
-                    Log.e(TAG, "FIREBASE ERROR: ${task.exception?.message}")
-                }
+                if (task.isSuccessful) Log.d(TAG, "UPLOAD SUCCESS: $label @ $address")
+                else Log.e(TAG, "UPLOAD FAILED: ${task.exception?.message}")
             }
-            
+
             recentDetections.add(report)
-            if (recentDetections.size > 20) recentDetections.poll()
-            
+            if (recentDetections.size > 50) recentDetections.removeAt(0)
+
             runOnUiThread {
-                Toast.makeText(baseContext, "Detection Logged: $label", Toast.LENGTH_SHORT).show()
+                Toast.makeText(baseContext, "Reported: $label", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Local save error: ${e.message}")
+            Log.e(TAG, "Save failed: ${e.message}")
         }
     }
 
@@ -327,8 +312,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
+            Manifest.permission.ACCESS_FINE_LOCATION
         )
     }
 }
