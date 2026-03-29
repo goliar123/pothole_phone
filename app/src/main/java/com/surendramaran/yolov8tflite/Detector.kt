@@ -115,10 +115,10 @@ class Detector(
             val expectedShape = if (isTransposed) intArrayOf(1, numCols, numRows) else intArrayOf(1, numRows, numCols)
             val output = TensorBuffer.createFixedSize(expectedShape, OUTPUT_IMAGE_TYPE)
             interpreter?.run(processedImage.buffer, output.buffer) ?: return
-            
+
             val bestBoxes = bestBox(output.floatArray)
             inferenceTime = SystemClock.uptimeMillis() - inferenceTime
-            
+
             if (bestBoxes == null) {
                 detectorListener.onEmptyDetect()
             } else {
@@ -166,7 +166,9 @@ class Detector(
             if (maxConf > CONFIDENCE_THRESHOLD) {
                 val clsName = labels.getOrElse(maxIdx) { "Class #$maxIdx" }
 
-                // 2. The Scaling Fix: Dynamically check if the model output is absolute or normalized
+                // FIX 1: If model outputs 0-100 instead of 0-1, convert it back to a decimal
+                val normalizedConf = if (maxConf > 1.0f) maxConf / 100.0f else maxConf
+
                 val scaleX = if (cx > 1.5f || w > 1.5f) tensorWidth.toFloat() else 1f
                 val scaleY = if (cy > 1.5f || h > 1.5f) tensorHeight.toFloat() else 1f
 
@@ -175,9 +177,10 @@ class Detector(
                 val x2 = (cx + (w / 2F)) / scaleX
                 val y2 = (cy + (h / 2F)) / scaleY
 
-                // Ensure the coordinates aren't wild outliers before
-                if (w*h>=0.5f) {
-                      boundingBoxes.add(BoundingBox(x1, y1, x2, y2, cx, cy, w, h, maxConf, maxIdx, clsName))
+                // FIX 2: Check for 5% of the screen (0.05f), NOT 50% (0.5f)
+                if (w * h >= 0.05f) {
+                    // Note: We are passing 'normalizedConf' here now instead of 'maxConf'
+                    boundingBoxes.add(BoundingBox(x1, y1, x2, y2, cx, cy, w, h, normalizedConf, maxIdx, clsName))
                 }
             }
         }

@@ -10,6 +10,7 @@ import android.graphics.RectF
 import android.location.Geocoder
 import android.location.Location
 import android.os.Bundle
+import android.os.Looper
 import android.util.Log
 import android.view.View
 import android.widget.Toast
@@ -20,6 +21,10 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.Priority
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
@@ -47,9 +52,10 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private var isDetecting = false
     private var lastInferenceTime = 0L // <--- ADD THIS LINE
+    private var currentLocation: Location? = null
+    private lateinit var locationCallback: LocationCallback
     private val recentDetections = mutableListOf<PotholeReport>()
     private val DB_URL = "https://pothhole-detect-default-rtdb.firebaseio.com"
-
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,6 +66,13 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             // Database setup
             database = FirebaseDatabase.getInstance(DB_URL).getReference("potholes")
             fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+            locationCallback = object : LocationCallback() {
+                override fun onLocationResult(locationResult: LocationResult) {
+                    for (location in locationResult.locations) {
+                        currentLocation = location // Constantly updates with live GPS
+                    }
+                }
+            }
             cameraExecutor = Executors.newSingleThreadExecutor()
 
             cameraExecutor.execute {
@@ -89,11 +102,20 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun startDetection() {
         isDetecting = true
         binding.cameraOverlay.visibility = View.GONE
         binding.startDetectionBtn.text = "Stop Detection"
         binding.startDetectionBtn.extend()
+
+        // --- ADD GPS REQUEST ---
+        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000)
+            .setMinUpdateIntervalMillis(1000)
+            .build()
+        fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
+        // -----------------------
+
         startCamera()
     }
 
@@ -103,10 +125,14 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         binding.startDetectionBtn.text = "Start Detection"
         binding.startDetectionBtn.shrink()
         cameraProvider?.unbindAll()
+
+        // --- STOP GPS TO SAVE BATTERY ---
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+        // --------------------------------
+
         binding.overlay.clear()
         binding.inferenceTime.text = ""
     }
-
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
@@ -145,7 +171,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             // --- NEW THROTTLING LOGIC ---
             val currentTime = System.currentTimeMillis()
             // 500ms means 2 frames per second. Change to 1000 for 1 frame per second.
-            if (currentTime - lastInferenceTime < 150) {
+            if (currentTime - lastInferenceTime < 500) {
                 imageProxy.close() // CRITICAL: You must close the proxy or the camera freezes!
                 return@setAnalyzer
             }
@@ -186,7 +212,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             Log.d(TAG, "DETECTION: ${box.clsName} @ ${box.cnf}")
 
             // Trigger upload for ANY detected crack/pothole from your label list
-            val rect = RectF(box.x1, box.y1, box.x2, box.y2)
+            // Scale the 0.0-1.0 fractions up to the 640x640 pixel size
+            val rect = RectF(box.x1 * 640, box.y1 * 640, box.x2 * 640, box.y2 * 640)
             val costLabel = calculatePotholeCost(rect, 640, 640)
 
             processDetection(costLabel, frame, box.clsName)
@@ -201,22 +228,35 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
     @SuppressLint("MissingPermission")
     private fun processDetection(cost: String, bitmap: Bitmap, originalLabel: String) {
-        fusedLocationClient.lastLocation.addOnSuccessListener { location ->
-            val currentTime = System.currentTimeMillis()
-
-            val isDuplicate = recentDetections.any {
-                val timeDiff = (currentTime - (it.time ?: 0)) / 1000
-                val results = FloatArray(1)
-                if (location != null && it.lat != null && it.lng != null) {
-                    Location.distanceBetween(location.latitude, location.longitude, it.lat, it.lng, results)
-                }
-                val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
-                timeDiff < 5 && distance < 2.0
+        // Fallback: If live GPS hasn't locked yet, try to use the last known cached location
+        if (currentLocation == null) {
+            fusedLocationClient.lastLocation.addOnSuccessListener { lastLoc ->
+                currentLocation = lastLoc
+                handleLocationAndUpload(cost, bitmap, originalLabel)
             }
+        } else {
+            handleLocationAndUpload(cost, bitmap, originalLabel)
+        }
+    }
 
-            if (!isDuplicate) {
-                saveDetectionLocally(location, cost, currentTime, bitmap, originalLabel)
+    // This handles the actual checking and uploading
+    private fun handleLocationAndUpload(cost: String, bitmap: Bitmap, originalLabel: String) {
+        val location = currentLocation
+        val currentTime = System.currentTimeMillis()
+
+        val isDuplicate = recentDetections.any {
+            val timeDiff = (currentTime - (it.time ?: 0)) / 1000
+            val results = FloatArray(1)
+            if (location != null && it.lat != null && it.lng != null) {
+                Location.distanceBetween(location.latitude, location.longitude, it.lat, it.lng, results)
             }
+            val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
+
+            timeDiff < 60 && distance < 5.0
+        }
+
+        if (!isDuplicate) {
+            saveDetectionLocally(location, cost, currentTime, bitmap, originalLabel)
         }
     }
 
