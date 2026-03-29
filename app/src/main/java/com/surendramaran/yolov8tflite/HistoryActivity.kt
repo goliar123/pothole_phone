@@ -7,6 +7,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -14,6 +15,7 @@ import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ValueEventListener
+import com.google.firebase.auth.FirebaseAuth
 import com.surendramaran.yolov8tflite.databinding.ActivityHistoryBinding
 import java.text.SimpleDateFormat
 import java.util.*
@@ -29,6 +31,36 @@ class HistoryActivity : AppCompatActivity() {
         binding = ActivityHistoryBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Sidebar Navigation
+        binding.toolbar.setNavigationOnClickListener {
+            binding.drawerLayout.open()
+        }
+
+        binding.navigationView.setNavigationItemSelectedListener { menuItem ->
+            when (menuItem.itemId) {
+                R.id.nav_logout -> {
+                    logout()
+                    true
+                }
+                else -> false
+            }
+        }
+
+        // Header Email Population
+        val headerView = binding.navigationView.getHeaderView(0)
+        val emailTextView = headerView.findViewById<TextView>(R.id.headerUserEmail)
+        val currentUser = FirebaseAuth.getInstance().currentUser
+
+        if (currentUser != null) {
+            emailTextView.text = currentUser.email ?: "Logged in"
+        } else {
+            // Safety check: if somehow user is here without auth, kick them to login
+            startActivity(Intent(this, LoginActivity::class.java))
+            finish()
+            return
+        }
+
+        // RecyclerView Setup
         adapter = HistoryAdapter(reportList) { report ->
             val intent = Intent(this, PotholeDetailActivity::class.java).apply {
                 putExtra("cost", report.cost)
@@ -45,44 +77,53 @@ class HistoryActivity : AppCompatActivity() {
         binding.historyRecyclerView.layoutManager = LinearLayoutManager(this)
         binding.historyRecyclerView.adapter = adapter
 
-        fetchHistory()
+        // Fetch user-specific data
+        fetchHistory(currentUser.uid)
 
         binding.newDetectionFab.setOnClickListener {
             startActivity(Intent(this, MainActivity::class.java))
         }
-
-        binding.logoutBtn.setOnClickListener {
-            logout()
-        }
     }
 
     private fun logout() {
+        // 1. Sign out from Firebase (Crucial for the security rules)
+        FirebaseAuth.getInstance().signOut()
+
+        // 2. Clear local prefs (if you are still using them)
         val sharedPref = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
         sharedPref.edit().putBoolean("isLoggedIn", false).apply()
-        
+
+        // 3. Clear activity stack and go to Login
         val intent = Intent(this, LoginActivity::class.java)
         intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         startActivity(intent)
         finish()
     }
 
-    private fun fetchHistory() {
-        val ref = FirebaseDatabase.getInstance(DB_URL).getReference("potholes")
+    private fun fetchHistory(uid: String) {
+        // Update path to match: users / UID / potholes
+        val ref = FirebaseDatabase.getInstance(DB_URL)
+            .getReference("users")
+            .child(uid)
+            .child("potholes")
+
         ref.addValueEventListener(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 reportList.clear()
                 for (data in snapshot.children) {
                     val report = data.getValue(PotholeReport::class.java)
-                    report?.let { 
+                    report?.let {
                         it.id = data.key
-                        reportList.add(it) 
+                        reportList.add(it)
                     }
                 }
                 reportList.sortByDescending { it.time }
                 adapter.notifyDataSetChanged()
             }
 
-            override fun onCancelled(error: DatabaseError) {}
+            override fun onCancelled(error: DatabaseError) {
+                Toast.makeText(this@HistoryActivity, "Database Error: ${error.message}", Toast.LENGTH_SHORT).show()
+            }
         })
     }
 

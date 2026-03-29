@@ -62,6 +62,7 @@ dependencies {
     implementation("com.google.firebase:firebase-database-ktx")
     implementation("com.google.firebase:firebase-storage-ktx")
     implementation("com.google.android.gms:play-services-location:21.0.1")
+    implementation("com.google.firebase:firebase-auth")
 
     // Image Loading
     implementation("com.github.bumptech.glide:glide:4.16.0")

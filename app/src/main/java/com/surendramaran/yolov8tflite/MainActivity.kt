@@ -64,7 +64,18 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             setContentView(binding.root)
 
             // Database setup
-            database = FirebaseDatabase.getInstance(DB_URL).getReference("potholes")
+            val currentUser = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
+            if (currentUser != null) {
+                // Path becomes: /users/USER_ID/potholes/
+                database = FirebaseDatabase.getInstance(DB_URL)
+                    .getReference("users")
+                    .child(currentUser.uid)
+                    .child("potholes")
+            } else {
+                // Fallback if somehow not logged in
+                Toast.makeText(this, "Error: Not logged in", Toast.LENGTH_LONG).show()
+                finish()
+            }
             fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
             locationCallback = object : LocationCallback() {
                 override fun onLocationResult(locationResult: LocationResult) {
