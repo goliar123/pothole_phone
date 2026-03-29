@@ -53,24 +53,39 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
         super.onDraw(canvas)
 
         for (result in results) {
-            // Coordinate transformation logic
-            // Assuming model output is 0.0 to 1.0 based on a square 640x640 input
-            // We scale to the View's dimensions
-            val left = result.x1 * width
-            val top = result.y1 * height
-            val right = result.x2 * width
-            val bottom = result.y2 * height
+            // 1. Get original oversized coordinates
+            val origLeft = result.x1 * width
+            val origTop = result.y1 * height
+            val origRight = result.x2 * width
+            val origBottom = result.y2 * height
+
+            // 2. Find the center point and original dimensions
+            val boxWidth = origRight - origLeft
+            val boxHeight = origBottom - origTop
+            val centerX = origLeft + (boxWidth / 2f)
+            val centerY = origTop + (boxHeight / 2f)
+
+            // 3. APPLY VISUAL SHRINK (0.8 = 20% tighter)
+            val visualShrink = 0.8f
+            val tightWidth = boxWidth * visualShrink
+            val tightHeight = boxHeight * visualShrink
+
+            // 4. Calculate new tight boundaries
+            val left = centerX - (tightWidth / 2f)
+            val top = centerY - (tightHeight / 2f)
+            val right = centerX + (tightWidth / 2f)
+            val bottom = centerY + (tightHeight / 2f)
 
             val rect = RectF(left, top, right, bottom)
             val cornerRadius = 16f
 
-            // 1. Draw Highlight
+            // Draw Highlight
             canvas.drawRoundRect(rect, cornerRadius, cornerRadius, fillPaint)
 
-            // 2. Draw Outline
+            // Draw Outline
             canvas.drawRoundRect(rect, cornerRadius, cornerRadius, boxPaint)
 
-            // 3. Draw Label Pill
+            // Draw Label Pill (Automatically adjusts to new tight position)
             val drawableText = "${result.clsName} ${(result.cnf * 100).toInt()}%"
             textPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
             val textWidth = bounds.width()

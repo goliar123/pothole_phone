@@ -7,7 +7,6 @@ data class PotholeReport(
     var id: String? = null,
     val lat: Double? = 0.0,
     val lng: Double? = 0.0,
-    val address: String? = null,
     val cost: String? = "",
     val time: Long? = 0L,
     val status: String? = "Pending",

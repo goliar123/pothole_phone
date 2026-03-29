@@ -68,7 +68,6 @@ class HistoryActivity : AppCompatActivity() {
                 putExtra("status", report.status)
                 putExtra("lat", report.lat)
                 putExtra("lng", report.lng)
-                putExtra("address", report.address)
                 putExtra("localImagePath", report.localImagePath)
             }
             startActivity(intent)

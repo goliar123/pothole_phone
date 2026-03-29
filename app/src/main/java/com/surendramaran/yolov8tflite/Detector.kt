@@ -163,11 +163,12 @@ class Detector(
                 }
             }
 
-            if (maxConf > CONFIDENCE_THRESHOLD) {
-                val clsName = labels.getOrElse(maxIdx) { "Class #$maxIdx" }
+            // FIX 1: Convert to decimal BEFORE checking the threshold
+            val normalizedConf = if (maxConf > 1.0f) maxConf / 100.0f else maxConf
 
-                // FIX 1: If model outputs 0-100 instead of 0-1, convert it back to a decimal
-                val normalizedConf = if (maxConf > 1.0f) maxConf / 100.0f else maxConf
+            // Check against the threshold using the proper 0.0 to 1.0 decimal
+            if (normalizedConf > CONFIDENCE_THRESHOLD) {
+                val clsName = labels.getOrElse(maxIdx) { "Class #$maxIdx" }
 
                 val scaleX = if (cx > 1.5f || w > 1.5f) tensorWidth.toFloat() else 1f
                 val scaleY = if (cy > 1.5f || h > 1.5f) tensorHeight.toFloat() else 1f
@@ -225,7 +226,11 @@ class Detector(
         private const val INPUT_STANDARD_DEVIATION = 255f
         private val INPUT_IMAGE_TYPE = DataType.FLOAT32
         private val OUTPUT_IMAGE_TYPE = DataType.FLOAT32
-        private const val CONFIDENCE_THRESHOLD = 0.8F
+
+        // Change from 0.8F to 0.5F (Only show boxes 50% or more confident)
+        private const val CONFIDENCE_THRESHOLD = 0.75F
+
+        // Change from 0.5F to 0.35F (Delete overlapping boxes more aggressively)
         private const val IOU_THRESHOLD = 0.5F
     }
 }

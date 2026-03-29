@@ -25,6 +25,7 @@ import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
 import com.surendramaran.yolov8tflite.Constants.LABELS_PATH
@@ -239,15 +240,26 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
     @SuppressLint("MissingPermission")
     private fun processDetection(cost: String, bitmap: Bitmap, originalLabel: String) {
-        // Fallback: If live GPS hasn't locked yet, try to use the last known cached location
-        if (currentLocation == null) {
-            fusedLocationClient.lastLocation.addOnSuccessListener { lastLoc ->
-                currentLocation = lastLoc
-                handleLocationAndUpload(cost, bitmap, originalLabel)
+        // Request a fresh, highly accurate location exactly at the moment of capture
+        val cancellationTokenSource = CancellationTokenSource()
+
+        fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cancellationTokenSource.token)
+            .addOnSuccessListener { exactLocation ->
+                if (exactLocation != null) {
+                    currentLocation = exactLocation // Update our tracked location
+                    handleLocationAndUpload(cost, bitmap, originalLabel)
+                } else {
+                    // Fallback ONLY if the fresh request completely fails, use the active listener's location
+                    currentLocation?.let { activeLoc ->
+                        handleLocationAndUpload(cost, bitmap, originalLabel)
+                    } ?: run {
+                        Log.e(TAG, "Waiting for GPS lock... Location is completely unavailable.")
+                    }
+                }
             }
-        } else {
-            handleLocationAndUpload(cost, bitmap, originalLabel)
-        }
+            .addOnFailureListener { exception ->
+                Log.e(TAG, "Failed to get exact location: ${exception.message}")
+            }
     }
 
     // This handles the actual checking and uploading
@@ -257,11 +269,15 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
         val isDuplicate = recentDetections.any {
             val timeDiff = (currentTime - (it.time ?: 0)) / 1000
-            val results = FloatArray(1)
+
+            // Default to a massive distance
+            var distance = Float.MAX_VALUE
+
             if (location != null && it.lat != null && it.lng != null) {
+                val results = FloatArray(1)
                 Location.distanceBetween(location.latitude, location.longitude, it.lat, it.lng, results)
+                distance = results[0] // Only update if we successfully calculate it
             }
-            val distance = if (results.isNotEmpty()) results[0] else Float.MAX_VALUE
 
             timeDiff < 60 && distance < 5.0
         }
@@ -280,12 +296,10 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 70, fos)
             fos.close()
 
-            val address = location?.let { getAddress(it.latitude, it.longitude) } ?: "Indoor/No Location"
 
             val report = PotholeReport(
                 lat = location?.latitude ?: 0.0,
                 lng = location?.longitude ?: 0.0,
-                address = address,
                 cost = cost,
                 time = time,
                 status = "Pending ($label)", // Include original label
@@ -293,10 +307,26 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 isDuplicate = false
             )
 
-            database.push().setValue(report).addOnCompleteListener { task ->
-                if (task.isSuccessful) Log.d(TAG, "UPLOAD SUCCESS: $label @ $address")
-                else Log.e(TAG, "UPLOAD FAILED: ${task.exception?.message}")
-            }
+            // 1. Send it to Firebase
+            database.push().setValue(report)
+                .addOnSuccessListener {
+                    // This ONLY fires if the cloud database actually saves the data
+                    Log.d(TAG, "UPLOAD SUCCESS: $label")
+                    runOnUiThread {
+                        Toast.makeText(baseContext, "☁️ Cloud Upload Success!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                .addOnFailureListener { exception ->
+                    // This fires if Firebase rejects it (Rules, Network, etc.)
+                    Log.e(TAG, "UPLOAD FAILED: ${exception.message}")
+                    runOnUiThread {
+                        Toast.makeText(baseContext, "❌ Cloud Error: ${exception.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+
+            // 2. Add to your local list so the History screen still works
+            recentDetections.add(report)
+            if (recentDetections.size > 50) recentDetections.removeAt(0)
 
             recentDetections.add(report)
             if (recentDetections.size > 50) recentDetections.removeAt(0)
@@ -309,32 +339,39 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
-    private fun getAddress(lat: Double, lng: Double): String {
-        return try {
-            val geocoder = Geocoder(this, Locale.getDefault())
-            val addresses = geocoder.getFromLocation(lat, lng, 1)
-            addresses?.get(0)?.getAddressLine(0) ?: "Unknown Address"
-        } catch (e: Exception) {
-            "Address lookup failed"
-        }
-    }
 
     private fun calculatePotholeCost(box: RectF, frameWidth: Int, frameHeight: Int): String {
-        val cameraHeightMeters = 1.5
-        val cameraTiltDegrees = 45.0
-        val asphaltDensity = 2300.0
-        val pricePerKgInr = 15.0
+        val widthRatio = box.width() / frameWidth.toFloat()
+        val heightRatio = box.height() / frameHeight.toFloat()
 
-        val horizonY = frameHeight / 2.0
-        val boxBottomY = box.bottom
-        if (boxBottomY < horizonY) return "₹0"
+        // --- THE FIX: SHRINK THE LOOSE BOUNDING BOX ---
+        // The YOLO model draws boxes too large. Let's assume the actual pothole
+        // only takes up about 60% of the area inside the red box.
+        val tightnessFactor = 0.60
 
-        val screenRatio = (boxBottomY - horizonY) / (frameHeight - horizonY)
-        val distanceMeters = cameraHeightMeters / (screenRatio * tan(Math.toRadians(cameraTiltDegrees)))
+        val tightWidthRatio = widthRatio * tightnessFactor
+        val tightHeightRatio = heightRatio * tightnessFactor
 
-        val realWidth = (distanceMeters / 0.8) * (box.width() / frameWidth)
-        val realLength = (distanceMeters / 0.8) * (box.height() / frameHeight) * 3.0
-        val volumeM3 = (realWidth * realLength) * 0.05
+        // 2. Assume the camera frame covers a road area roughly 4m wide and 6m long
+        val assumedRoadWidthMeters = 4.0
+        val assumedRoadLengthMeters = 6.0
+
+        // Multiply the tight ratio by the assumed road size
+        val estimatedWidthMeters = tightWidthRatio * assumedRoadWidthMeters
+        val estimatedLengthMeters = tightHeightRatio * assumedRoadLengthMeters
+
+        // Clamp the values (Min: 10cm | Max: 2.5m wide, 3.0m long)
+        val clampedWidth = estimatedWidthMeters.coerceIn(0.1, 2.5)
+        val clampedLength = estimatedLengthMeters.coerceIn(0.1, 3.0)
+
+        // 3. Calculate Volume (Assume a standard 5cm / 0.05m repair depth)
+        val depthMeters = 0.05
+        val volumeM3 = clampedWidth * clampedLength * depthMeters
+
+        // 4. Calculate Final Cost
+        val asphaltDensity = 2300.0 // kg per cubic meter of asphalt
+        val pricePerKgInr = 15.0    // ₹15 per kg
+
         val costRupees = (volumeM3 * asphaltDensity) * pricePerKgInr
 
         return "₹${"%.0f".format(costRupees)}"
